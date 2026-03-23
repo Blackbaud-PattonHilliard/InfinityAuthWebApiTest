@@ -31,7 +31,7 @@ Edit `appsettings.json`:
 {
   "ServiceUrl": "https://crm5740s29.sky.blackbaud.com/5740S29/appfxwebservice.asmx",
   "Database": "5740S29",
-  "Username": "APIUser5740S29",
+  "Username": "...",
   "Password": "...",
   "Domain": "s29"
 }
@@ -45,8 +45,3 @@ bin\Debug\InfinityAuthWebApiTest.exe
 ```
 
 Log files are written to `bin\Debug\auth-test-YYYYMMDD-HHmmss.log`.
-
-## See Also
-
-- **InfinityAuthWebApiUpgradeTest** — demonstrates the fix using Basic auth header injection
-- **InfinityAuthTest** — same WebAPI library with Basic auth via `CredentialCache` (works against localhost where IIS advertises Basic, but not through App Gateway v2 where the server only advertises Negotiate/NTLM)
