@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Threading;
 using System.Web.Services.Protocols;
@@ -32,10 +33,22 @@ namespace InfinityAuthWebApiTest
                 Log($"Log:      {logPath}");
                 Log("");
 
-                // Get public IP (like ipchicken)
+                // Network info
                 var publicIp = GetPublicIp();
-                Log($"Public IP:  {publicIp}");
-                Log($"Local IPs:  {GetLocalIps()}");
+                Log($"Public IP:   {publicIp}");
+                Log($"Local IPs:   {GetLocalIps()}");
+                Log($"Hostname:    {Dns.GetHostName()}");
+
+                // Resolve server IP
+                var serverHost = new Uri(settings.ServiceUrl).Host;
+                var serverIps = ResolveHost(serverHost);
+                Log($"Server Host: {serverHost}");
+                Log($"Server IPs:  {serverIps}");
+
+                // ServicePoint info
+                var sp = ServicePointManager.FindServicePoint(new Uri(settings.ServiceUrl));
+                Log($"TLS:         {ServicePointManager.SecurityProtocol}");
+                Log($"Connection Limit: {sp.ConnectionLimit}");
                 Log("");
 
                 const int iterations = 10;
@@ -51,7 +64,8 @@ namespace InfinityAuthWebApiTest
                 {
                     Log($"── Iteration {i}/{iterations} ──");
 
-                    var provider = CreateProvider(settings);
+                    var diagService = new DiagnosticWebService();
+                    var provider = CreateProvider(settings, diagService);
                     var sw = Stopwatch.StartNew();
 
                     try
@@ -72,12 +86,16 @@ namespace InfinityAuthWebApiTest
                             foreach (var db in reply.Databases)
                                 Log($"     {db}");
                         }
+
+                        // Log request/response details on success
+                        LogDiagnostics(diagService);
                         passes++;
                     }
                     catch (SoapException soapEx)
                     {
                         sw.Stop();
                         Log($"  << SOAP ERROR ({sw.ElapsedMilliseconds}ms): {soapEx.Message}", ConsoleColor.Red);
+                        LogDiagnostics(diagService);
                         failures++;
                     }
                     catch (WebException webEx)
@@ -86,21 +104,39 @@ namespace InfinityAuthWebApiTest
                         if (webEx.Response is HttpWebResponse resp)
                         {
                             Log($"  << HTTP {(int)resp.StatusCode} {resp.StatusDescription} ({sw.ElapsedMilliseconds}ms)", ConsoleColor.Red);
-
-                            // Log response headers
+                            Log("  Response Headers:");
                             foreach (string header in resp.Headers)
                                 Log($"     {header}: {resp.Headers[header]}");
+
+                            // Try to read response body
+                            try
+                            {
+                                using (var reader = new StreamReader(resp.GetResponseStream()))
+                                {
+                                    var body = reader.ReadToEnd();
+                                    if (!string.IsNullOrWhiteSpace(body))
+                                        Log($"  Response Body: {body.Substring(0, Math.Min(500, body.Length))}");
+                                }
+                            }
+                            catch { }
                         }
                         else
                         {
                             Log($"  << WebException ({sw.ElapsedMilliseconds}ms): {webEx.Message}", ConsoleColor.Red);
+                            if (webEx.InnerException != null)
+                                Log($"     Inner: {webEx.InnerException.GetType().Name}: {webEx.InnerException.Message}");
                         }
+
+                        LogDiagnostics(diagService);
                         failures++;
                     }
                     catch (Exception ex)
                     {
                         sw.Stop();
                         Log($"  << EXCEPTION ({sw.ElapsedMilliseconds}ms): {ex.GetType().Name}: {ex.Message}", ConsoleColor.Red);
+                        if (ex.InnerException != null)
+                            Log($"     Inner: {ex.InnerException.GetType().Name}: {ex.InnerException.Message}");
+                        LogDiagnostics(diagService);
                         failures++;
                     }
 
@@ -130,72 +166,109 @@ namespace InfinityAuthWebApiTest
             }
         }
 
-        static void Log(string message, ConsoleColor? color = null)
+        // ─────────────────────────────────────────────────────────────
+        // Diagnostic subclass — captures request/response headers
+        // ─────────────────────────────────────────────────────────────
+
+        class DiagnosticWebService : AppFxWebService
         {
-            var timestamped = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}";
+            public WebHeaderCollection LastRequestHeaders { get; private set; }
+            public WebHeaderCollection LastResponseHeaders { get; private set; }
+            public string LastRequestMethod { get; private set; }
+            public Uri LastRequestUri { get; private set; }
+            public HttpStatusCode? LastResponseStatus { get; private set; }
+            public string LastResponseServer { get; private set; }
 
-            // Write to log file
-            _log.WriteLine(timestamped);
+            protected override WebRequest GetWebRequest(Uri uri)
+            {
+                var request = base.GetWebRequest(uri);
+                LastRequestUri = uri;
 
-            // Write to console (with optional color)
-            if (color.HasValue)
-                Console.ForegroundColor = color.Value;
-            Console.WriteLine(timestamped);
-            if (color.HasValue)
-                Console.ResetColor();
+                if (request is HttpWebRequest httpReq)
+                {
+                    LastRequestMethod = httpReq.Method;
+                    // Headers aren't fully populated until send, capture what we can
+                    LastRequestHeaders = httpReq.Headers;
+                }
+
+                return request;
+            }
+
+            protected override WebResponse GetWebResponse(WebRequest request)
+            {
+                var response = base.GetWebResponse(request);
+
+                if (response is HttpWebResponse httpResp)
+                {
+                    LastResponseHeaders = httpResp.Headers;
+                    LastResponseStatus = httpResp.StatusCode;
+                    LastResponseServer = httpResp.Server;
+                }
+
+                return response;
+            }
         }
 
-        static string GetPublicIp()
+        static void LogDiagnostics(DiagnosticWebService svc)
         {
-            try
+            if (svc.LastRequestUri != null)
             {
-                using (var client = new WebClient())
+                Log($"  Request:");
+                Log($"     {svc.LastRequestMethod ?? "POST"} {svc.LastRequestUri}");
+                if (svc.LastRequestHeaders != null)
                 {
-                    var ip = client.DownloadString("https://api.ipify.org").Trim();
-                    return ip;
+                    foreach (string header in svc.LastRequestHeaders)
+                    {
+                        // Skip large/noisy headers
+                        var val = svc.LastRequestHeaders[header];
+                        if (val != null && val.Length > 200)
+                            val = val.Substring(0, 200) + "...";
+                        Log($"     {header}: {val}");
+                    }
                 }
             }
-            catch (Exception ex)
-            {
-                return $"(unable to determine: {ex.Message})";
-            }
-        }
 
-        static string GetLocalIps()
-        {
-            try
+            if (svc.LastResponseHeaders != null)
             {
-                var host = Dns.GetHostEntry(Dns.GetHostName());
-                var ips = new System.Collections.Generic.List<string>();
-                foreach (var addr in host.AddressList)
+                Log($"  Response:");
+                if (svc.LastResponseStatus.HasValue)
+                    Log($"     Status: {(int)svc.LastResponseStatus.Value} {svc.LastResponseStatus.Value}");
+                if (!string.IsNullOrEmpty(svc.LastResponseServer))
+                    Log($"     Server: {svc.LastResponseServer}");
+                foreach (string header in svc.LastResponseHeaders)
                 {
-                    if (addr.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-                        ips.Add(addr.ToString());
+                    var val = svc.LastResponseHeaders[header];
+                    if (val != null && val.Length > 200)
+                        val = val.Substring(0, 200) + "...";
+                    Log($"     {header}: {val}");
                 }
-                return ips.Count > 0 ? string.Join(", ", ips) : "(none)";
-            }
-            catch
-            {
-                return "(unable to determine)";
             }
         }
 
-        static Settings LoadSettings()
+        // ─────────────────────────────────────────────────────────────
+        // Provider factory — uses diagnostic subclass
+        // ─────────────────────────────────────────────────────────────
+
+        class DiagnosticProvider : AppFxWebServiceProvider
         {
-            var configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "appsettings.json");
-            if (!File.Exists(configPath))
+            readonly DiagnosticWebService _svc;
+
+            public DiagnosticProvider(DiagnosticWebService svc)
             {
-                Console.WriteLine($"Missing: {configPath}");
-                Environment.Exit(1);
+                _svc = svc;
             }
 
-            var json = File.ReadAllText(configPath);
-            return new Settings(json);
+            public override AppFxWebService CreateAppFxWebService()
+            {
+                _svc.Url = this.Url;
+                _svc.Credentials = this.Credentials;
+                return _svc;
+            }
         }
 
-        static AppFxWebServiceProvider CreateProvider(Settings settings)
+        static AppFxWebServiceProvider CreateProvider(Settings settings, DiagnosticWebService diagService)
         {
-            var provider = new AppFxWebServiceProvider();
+            var provider = new DiagnosticProvider(diagService);
             provider.Url = settings.ServiceUrl;
             provider.Database = settings.Database;
             provider.ApplicationName = "InfinityAuthWebApiTest";
@@ -210,17 +283,90 @@ namespace InfinityAuthWebApiTest
             return provider;
         }
 
+        // ─────────────────────────────────────────────────────────────
+        // Helpers
+        // ─────────────────────────────────────────────────────────────
+
+        static void Log(string message, ConsoleColor? color = null)
+        {
+            var timestamped = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}";
+
+            _log.WriteLine(timestamped);
+
+            if (color.HasValue)
+                Console.ForegroundColor = color.Value;
+            Console.WriteLine(timestamped);
+            if (color.HasValue)
+                Console.ResetColor();
+        }
+
+        static string GetPublicIp()
+        {
+            try
+            {
+                using (var client = new WebClient())
+                    return client.DownloadString("https://api.ipify.org").Trim();
+            }
+            catch (Exception ex)
+            {
+                return $"(unable to determine: {ex.Message})";
+            }
+        }
+
+        static string GetLocalIps()
+        {
+            try
+            {
+                var host = Dns.GetHostEntry(Dns.GetHostName());
+                var ips = host.AddressList
+                    .Where(a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                    .Select(a => a.ToString())
+                    .ToArray();
+                return ips.Length > 0 ? string.Join(", ", ips) : "(none)";
+            }
+            catch
+            {
+                return "(unable to determine)";
+            }
+        }
+
+        static string ResolveHost(string hostname)
+        {
+            try
+            {
+                var entry = Dns.GetHostEntry(hostname);
+                var ips = entry.AddressList
+                    .Select(a => a.ToString())
+                    .ToArray();
+                return ips.Length > 0 ? string.Join(", ", ips) : "(no addresses)";
+            }
+            catch (Exception ex)
+            {
+                return $"(unable to resolve: {ex.Message})";
+            }
+        }
+
         static string FormatUser(Settings settings)
         {
             return string.IsNullOrEmpty(settings.Domain)
                 ? settings.Username
                 : $"{settings.Domain}\\{settings.Username}";
         }
+
+        static Settings LoadSettings()
+        {
+            var configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "appsettings.json");
+            if (!File.Exists(configPath))
+            {
+                Console.WriteLine($"Missing: {configPath}");
+                Environment.Exit(1);
+            }
+
+            var json = File.ReadAllText(configPath);
+            return new Settings(json);
+        }
     }
 
-    /// <summary>
-    /// Minimal JSON settings reader — avoids Newtonsoft dependency.
-    /// </summary>
     class Settings
     {
         public string ServiceUrl { get; }
