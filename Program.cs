@@ -3,6 +3,9 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Web.Services.Protocols;
 using Blackbaud.AppFx.WebAPI;
@@ -16,26 +19,39 @@ namespace InfinityAuthWebApiTest
 
         static int Main(string[] args)
         {
-            var logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, $"auth-test-{DateTime.Now:yyyyMMdd-HHmmss}.log");
+            var settings = LoadSettings();
+
+            // When using a proxy (Fiddler), trust its HTTPS interception certificate
+            if (!string.IsNullOrEmpty(settings.ProxyUrl))
+            {
+                ServicePointManager.ServerCertificateValidationCallback =
+                    (object sender, X509Certificate cert, X509Chain chain, SslPolicyErrors errors) => true;
+            }
+
+            // Build descriptive log filename: auth-test-{host}-{mode}-YYYYMMDD-HHmmss.log
+            var hostShort = new Uri(settings.ServiceUrl).Host.Split('.')[0];
+            var modeLabel = settings.ReuseConnection ? "reuse" : "no-reuse";
+            var logName = $"auth-test-{hostShort}-{modeLabel}-{DateTime.Now:yyyyMMdd-HHmmss}.log";
+            var logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, logName);
             _log = new StreamWriter(logPath, append: true) { AutoFlush = true };
 
             try
             {
-                var settings = LoadSettings();
-
                 Log("════════════════════════════════════════════════════════════════");
                 Log("InfinityAuthWebApiTest — NTLM Auth Soak Test");
                 Log("════════════════════════════════════════════════════════════════");
-                Log($"URL:      {settings.ServiceUrl}");
-                Log($"Database: {settings.Database}");
-                Log($"User:     {FormatUser(settings)}");
-                Log($"Auth:     NTLM");
-                Log($"Log:      {logPath}");
+                Log($"URL:        {settings.ServiceUrl}");
+                Log($"Database:   {settings.Database}");
+                Log($"User:       {FormatUser(settings)}");
+                Log($"Auth:       NTLM");
+                Log($"Mode:       {(settings.ReuseConnection ? "REUSE connection (same ephemeral source port)" : "NEW connection each iteration (different source port)")}");
+                if (!string.IsNullOrEmpty(settings.ProxyUrl))
+                    Log($"Proxy:      {settings.ProxyUrl}");
+                Log($"Log:        {logPath}");
                 Log("");
 
                 // Network info
-                var publicIp = GetPublicIp();
-                Log($"Public IP:   {publicIp}");
+                Log($"Public IP:   {GetPublicIp()}");
                 Log($"Local IPs:   {GetLocalIps()}");
                 Log($"Hostname:    {Dns.GetHostName()}");
 
@@ -48,7 +64,7 @@ namespace InfinityAuthWebApiTest
                 // ServicePoint info
                 var sp = ServicePointManager.FindServicePoint(new Uri(settings.ServiceUrl));
                 Log($"TLS:         {ServicePointManager.SecurityProtocol}");
-                Log($"Connection Limit: {sp.ConnectionLimit}");
+                Log($"Conn Limit:  {sp.ConnectionLimit}");
                 Log("");
 
                 const int iterations = 10;
@@ -60,12 +76,42 @@ namespace InfinityAuthWebApiTest
                 Log("────────────────────────────────────────────────────────────────");
                 Log("");
 
+                // For reuse mode: create one service/provider and reuse across iterations
+                DiagnosticWebService sharedDiagService = null;
+                AppFxWebServiceProvider sharedProvider = null;
+
+                if (settings.ReuseConnection)
+                {
+                    sharedDiagService = new DiagnosticWebService();
+                    sharedProvider = CreateProvider(settings, sharedDiagService);
+
+                    // Pre-authenticate to establish the connection
+                    sharedDiagService.PreAuthenticate = true;
+                }
+
+                // Capture server endpoint for source port lookups
+                var serverEndpoint = ResolveServerEndpoint(serverHost);
+
                 for (int i = 1; i <= iterations; i++)
                 {
                     Log($"── Iteration {i}/{iterations} ──");
 
-                    var diagService = new DiagnosticWebService();
-                    var provider = CreateProvider(settings, diagService);
+                    DiagnosticWebService diagService;
+                    AppFxWebServiceProvider provider;
+
+                    if (settings.ReuseConnection)
+                    {
+                        diagService = sharedDiagService;
+                        provider = sharedProvider;
+                    }
+                    else
+                    {
+                        // New connection each time
+                        diagService = new DiagnosticWebService();
+                        diagService.KeepAlive = false;
+                        provider = CreateProvider(settings, diagService);
+                    }
+
                     var sw = Stopwatch.StartNew();
 
                     try
@@ -87,47 +133,47 @@ namespace InfinityAuthWebApiTest
                                 Log($"     {db}");
                         }
 
-                        // Log request/response details on success
-                        LogDiagnostics(diagService);
+                        LogRequest(diagService);
+                        LogResponse(diagService);
+                        LogSourcePort(serverEndpoint);
                         passes++;
                     }
                     catch (SoapException soapEx)
                     {
                         sw.Stop();
                         Log($"  << SOAP ERROR ({sw.ElapsedMilliseconds}ms): {soapEx.Message}", ConsoleColor.Red);
-                        LogDiagnostics(diagService);
+                        LogRequest(diagService);
+                        LogResponse(diagService);
+                        LogSourcePort(serverEndpoint);
                         failures++;
                     }
                     catch (WebException webEx)
                     {
                         sw.Stop();
+
                         if (webEx.Response is HttpWebResponse resp)
                         {
                             Log($"  << HTTP {(int)resp.StatusCode} {resp.StatusDescription} ({sw.ElapsedMilliseconds}ms)", ConsoleColor.Red);
-                            Log("  Response Headers:");
-                            foreach (string header in resp.Headers)
-                                Log($"     {header}: {resp.Headers[header]}");
-
-                            // Try to read response body
-                            try
-                            {
-                                using (var reader = new StreamReader(resp.GetResponseStream()))
-                                {
-                                    var body = reader.ReadToEnd();
-                                    if (!string.IsNullOrWhiteSpace(body))
-                                        Log($"  Response Body: {body.Substring(0, Math.Min(500, body.Length))}");
-                                }
-                            }
-                            catch { }
                         }
                         else
                         {
-                            Log($"  << WebException ({sw.ElapsedMilliseconds}ms): {webEx.Message}", ConsoleColor.Red);
+                            Log($"  << WebException ({sw.ElapsedMilliseconds}ms): {webEx.Status} — {webEx.Message}", ConsoleColor.Red);
                             if (webEx.InnerException != null)
                                 Log($"     Inner: {webEx.InnerException.GetType().Name}: {webEx.InnerException.Message}");
                         }
 
-                        LogDiagnostics(diagService);
+                        LogRequest(diagService);
+
+                        if (diagService.LastResponseHeaders != null)
+                        {
+                            LogResponse(diagService);
+                        }
+                        else if (webEx.Response is HttpWebResponse errorResp)
+                        {
+                            LogResponseFromException(errorResp);
+                        }
+
+                        LogSourcePort(serverEndpoint);
                         failures++;
                     }
                     catch (Exception ex)
@@ -136,7 +182,9 @@ namespace InfinityAuthWebApiTest
                         Log($"  << EXCEPTION ({sw.ElapsedMilliseconds}ms): {ex.GetType().Name}: {ex.Message}", ConsoleColor.Red);
                         if (ex.InnerException != null)
                             Log($"     Inner: {ex.InnerException.GetType().Name}: {ex.InnerException.Message}");
-                        LogDiagnostics(diagService);
+                        LogRequest(diagService);
+                        LogResponse(diagService);
+                        LogSourcePort(serverEndpoint);
                         failures++;
                     }
 
@@ -144,6 +192,12 @@ namespace InfinityAuthWebApiTest
 
                     if (i < iterations)
                     {
+                        // In no-reuse mode, close the ServicePoint to force a new connection
+                        if (!settings.ReuseConnection)
+                        {
+                            sp.CloseConnectionGroup("");
+                        }
+
                         Log($"  Waiting {delaySeconds}s...");
                         Thread.Sleep(delaySeconds * 1000);
                     }
@@ -153,6 +207,7 @@ namespace InfinityAuthWebApiTest
                 Log("════════════════════════════════════════════════════════════════");
                 Log("SUMMARY");
                 Log("════════════════════════════════════════════════════════════════");
+                Log($"  Mode:     {(settings.ReuseConnection ? "REUSE connection" : "NEW connection each iteration")}");
                 Log($"  Passes:   {passes}/{iterations}");
                 Log($"  Failures: {failures}/{iterations}");
                 Log($"  Result:   {(failures == 0 ? "ALL PASSED" : $"{failures} FAILED")}");
@@ -168,6 +223,7 @@ namespace InfinityAuthWebApiTest
 
         // ─────────────────────────────────────────────────────────────
         // Diagnostic subclass — captures request/response headers
+        // on both success and failure paths
         // ─────────────────────────────────────────────────────────────
 
         class DiagnosticWebService : AppFxWebService
@@ -179,16 +235,21 @@ namespace InfinityAuthWebApiTest
             public HttpStatusCode? LastResponseStatus { get; private set; }
             public string LastResponseServer { get; private set; }
 
+            public bool KeepAlive { get; set; } = true;
+
             protected override WebRequest GetWebRequest(Uri uri)
             {
                 var request = base.GetWebRequest(uri);
                 LastRequestUri = uri;
+                LastResponseHeaders = null;
+                LastResponseStatus = null;
+                LastResponseServer = null;
 
                 if (request is HttpWebRequest httpReq)
                 {
                     LastRequestMethod = httpReq.Method;
-                    // Headers aren't fully populated until send, capture what we can
                     LastRequestHeaders = httpReq.Headers;
+                    httpReq.KeepAlive = KeepAlive;
                 }
 
                 return request;
@@ -197,40 +258,60 @@ namespace InfinityAuthWebApiTest
             protected override WebResponse GetWebResponse(WebRequest request)
             {
                 var response = base.GetWebResponse(request);
+                CaptureResponse(response);
+                return response;
+            }
 
+            protected override WebResponse GetWebResponse(WebRequest request, IAsyncResult result)
+            {
+                var response = base.GetWebResponse(request, result);
+                CaptureResponse(response);
+                return response;
+            }
+
+            void CaptureResponse(WebResponse response)
+            {
                 if (response is HttpWebResponse httpResp)
                 {
                     LastResponseHeaders = httpResp.Headers;
                     LastResponseStatus = httpResp.StatusCode;
                     LastResponseServer = httpResp.Server;
                 }
-
-                return response;
             }
         }
 
-        static void LogDiagnostics(DiagnosticWebService svc)
-        {
-            if (svc.LastRequestUri != null)
-            {
-                Log($"  Request:");
-                Log($"     {svc.LastRequestMethod ?? "POST"} {svc.LastRequestUri}");
-                if (svc.LastRequestHeaders != null)
-                {
-                    foreach (string header in svc.LastRequestHeaders)
-                    {
-                        // Skip large/noisy headers
-                        var val = svc.LastRequestHeaders[header];
-                        if (val != null && val.Length > 200)
-                            val = val.Substring(0, 200) + "...";
-                        Log($"     {header}: {val}");
-                    }
-                }
-            }
+        // ─────────────────────────────────────────────────────────────
+        // Unified logging — same format for success and failure
+        // ─────────────────────────────────────────────────────────────
 
+        static void LogRequest(DiagnosticWebService svc)
+        {
+            Log("  Request:");
+            if (svc.LastRequestUri != null)
+                Log($"     {svc.LastRequestMethod ?? "POST"} {svc.LastRequestUri}");
+
+            if (svc.LastRequestHeaders != null)
+            {
+                foreach (string header in svc.LastRequestHeaders)
+                {
+                    var val = svc.LastRequestHeaders[header];
+                    if (val != null && val.Length > 200)
+                        val = val.Substring(0, 200) + "...";
+                    Log($"     {header}: {val}");
+                }
+                Log($"     KeepAlive: {svc.KeepAlive}");
+            }
+            else
+            {
+                Log("     (request headers not captured)");
+            }
+        }
+
+        static void LogResponse(DiagnosticWebService svc)
+        {
+            Log("  Response:");
             if (svc.LastResponseHeaders != null)
             {
-                Log($"  Response:");
                 if (svc.LastResponseStatus.HasValue)
                     Log($"     Status: {(int)svc.LastResponseStatus.Value} {svc.LastResponseStatus.Value}");
                 if (!string.IsNullOrEmpty(svc.LastResponseServer))
@@ -242,6 +323,87 @@ namespace InfinityAuthWebApiTest
                         val = val.Substring(0, 200) + "...";
                     Log($"     {header}: {val}");
                 }
+            }
+            else
+            {
+                Log("     (response headers not captured via diagnostic proxy — see above for WebException details)");
+            }
+        }
+
+        static void LogResponseFromException(HttpWebResponse resp)
+        {
+            Log("  Response:");
+            Log($"     Status: {(int)resp.StatusCode} {resp.StatusDescription}");
+            if (!string.IsNullOrEmpty(resp.Server))
+                Log($"     Server: {resp.Server}");
+            foreach (string header in resp.Headers)
+            {
+                var val = resp.Headers[header];
+                if (val != null && val.Length > 200)
+                    val = val.Substring(0, 200) + "...";
+                Log($"     {header}: {val}");
+            }
+
+            try
+            {
+                using (var reader = new StreamReader(resp.GetResponseStream()))
+                {
+                    var body = reader.ReadToEnd();
+                    if (!string.IsNullOrWhiteSpace(body))
+                        Log($"  Response Body: {body.Substring(0, Math.Min(500, body.Length))}");
+                }
+            }
+            catch { }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // Source port logging — find active TCP connection to server
+        // ─────────────────────────────────────────────────────────────
+
+        static IPEndPoint ResolveServerEndpoint(string hostname)
+        {
+            try
+            {
+                var entry = Dns.GetHostEntry(hostname);
+                var ip = entry.AddressList.FirstOrDefault();
+                if (ip != null)
+                    return new IPEndPoint(ip, 443);
+            }
+            catch { }
+            return null;
+        }
+
+        static void LogSourcePort(IPEndPoint serverEndpoint)
+        {
+            if (serverEndpoint == null)
+            {
+                Log("  Source Port: (server endpoint unknown)");
+                return;
+            }
+
+            try
+            {
+                var connections = IPGlobalProperties.GetIPGlobalProperties()
+                    .GetActiveTcpConnections()
+                    .Where(c => c.RemoteEndPoint.Address.Equals(serverEndpoint.Address)
+                             && c.RemoteEndPoint.Port == serverEndpoint.Port)
+                    .ToArray();
+
+                if (connections.Length > 0)
+                {
+                    foreach (var conn in connections)
+                    {
+                        Log($"  Source Port: {conn.LocalEndPoint.Port} → {conn.RemoteEndPoint} (State: {conn.State})");
+                    }
+                }
+                else
+                {
+                    Log("  Source Port: (no active TCP connection to server — connection already closed)");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"  Source Port: (unable to determine: {ex.Message})");
             }
         }
 
@@ -258,10 +420,16 @@ namespace InfinityAuthWebApiTest
                 _svc = svc;
             }
 
+            public string ProxyUrl { get; set; }
+
             public override AppFxWebService CreateAppFxWebService()
             {
                 _svc.Url = this.Url;
                 _svc.Credentials = this.Credentials;
+
+                if (!string.IsNullOrEmpty(ProxyUrl))
+                    _svc.Proxy = new WebProxy(ProxyUrl);
+
                 return _svc;
             }
         }
@@ -272,6 +440,7 @@ namespace InfinityAuthWebApiTest
             provider.Url = settings.ServiceUrl;
             provider.Database = settings.Database;
             provider.ApplicationName = "InfinityAuthWebApiTest";
+            provider.ProxyUrl = settings.ProxyUrl;
 
             var cache = new CredentialCache();
             cache.Add(new Uri(settings.ServiceUrl), "NTLM",
@@ -374,6 +543,8 @@ namespace InfinityAuthWebApiTest
         public string Username { get; }
         public string Password { get; }
         public string Domain { get; }
+        public bool ReuseConnection { get; }
+        public string ProxyUrl { get; }
 
         public Settings(string json)
         {
@@ -382,6 +553,10 @@ namespace InfinityAuthWebApiTest
             Username = Extract(json, "Username");
             Password = Extract(json, "Password");
             Domain = Extract(json, "Domain");
+            ProxyUrl = Extract(json, "ProxyUrl");
+
+            var reuseStr = Extract(json, "ReuseConnection");
+            ReuseConnection = string.Equals(reuseStr, "true", StringComparison.OrdinalIgnoreCase);
         }
 
         static string Extract(string json, string key)
@@ -393,13 +568,19 @@ namespace InfinityAuthWebApiTest
             var colonIdx = json.IndexOf(':', idx + search.Length);
             if (colonIdx < 0) return "";
 
-            var quoteStart = json.IndexOf('"', colonIdx + 1);
-            if (quoteStart < 0) return "";
+            // Handle both string values ("value") and bare values (true/false)
+            var rest = json.Substring(colonIdx + 1).TrimStart();
+            if (rest.Length == 0) return "";
 
-            var quoteEnd = json.IndexOf('"', quoteStart + 1);
-            if (quoteEnd < 0) return "";
+            if (rest[0] == '"')
+            {
+                var quoteEnd = rest.IndexOf('"', 1);
+                return quoteEnd > 0 ? rest.Substring(1, quoteEnd - 1) : "";
+            }
 
-            return json.Substring(quoteStart + 1, quoteEnd - quoteStart - 1);
+            // Bare value (true, false, numbers)
+            var end = rest.IndexOfAny(new[] { ',', '}', '\r', '\n' });
+            return end > 0 ? rest.Substring(0, end).Trim() : rest.Trim();
         }
     }
 }
